@@ -871,6 +871,28 @@ cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
                               cuopt_int_t objective_offsets_size,
                               cuOptSolution* solution_ptr);
 
+/** @brief Solve a batch of LPs using device-resident override arrays.
+ *
+ * Same contract as cuOptSolveBatchLP, except non-null override pointers must
+ * point to GPU memory. The base problem must be GPU-backed.
+ */
+cuopt_int_t cuOptSolveBatchLPDeviceData(cuOptOptimizationProblem problem,
+                                        cuOptSolverSettings settings,
+                                        cuopt_int_t batch_size,
+                                        const cuopt_float_t* objective_coefficients,
+                                        cuopt_int_t objective_coefficients_size,
+                                        const cuopt_float_t* constraint_lower_bounds,
+                                        cuopt_int_t constraint_lower_bounds_size,
+                                        const cuopt_float_t* constraint_upper_bounds,
+                                        cuopt_int_t constraint_upper_bounds_size,
+                                        const cuopt_float_t* variable_lower_bounds,
+                                        cuopt_int_t variable_lower_bounds_size,
+                                        const cuopt_float_t* variable_upper_bounds,
+                                        cuopt_int_t variable_upper_bounds_size,
+                                        const cuopt_float_t* objective_offsets,
+                                        cuopt_int_t objective_offsets_size,
+                                        cuOptSolution* solution_ptr);
+
 /** @brief Get the number of LPs represented by a batch solution. */
 cuopt_int_t cuOptGetBatchSize(cuOptSolution solution, cuopt_int_t* batch_size_ptr);
 

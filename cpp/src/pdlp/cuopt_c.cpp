@@ -96,6 +96,29 @@ void assign_device_uvector_from_host(rmm::device_uvector<T>& target,
   if (size > 0) { raft::copy(target.data(), source, size, stream); }
 }
 
+template <typename T>
+void assign_device_uvector_from_device(rmm::device_uvector<T>& target,
+                                       const T* source,
+                                       std::size_t size,
+                                       rmm::cuda_stream_view stream)
+{
+  target.resize(size, stream);
+  if (size > 0) { raft::copy(target.data(), source, size, stream); }
+}
+
+template <typename T>
+std::vector<T> copy_device_to_host_vector(const T* source,
+                                          std::size_t size,
+                                          rmm::cuda_stream_view stream)
+{
+  std::vector<T> out(size);
+  if (size > 0) {
+    raft::copy(out.data(), source, size, stream);
+    stream.synchronize();
+  }
+  return out;
+}
+
 bool valid_optional_array(const cuopt_float_t* values, cuopt_int_t size)
 {
   if (size < 0) { return false; }
@@ -944,22 +967,25 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
   }
 }
 
-cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
-                              cuOptSolverSettings settings,
-                              cuopt_int_t batch_size,
-                              const cuopt_float_t* objective_coefficients,
-                              cuopt_int_t objective_coefficients_size,
-                              const cuopt_float_t* constraint_lower_bounds,
-                              cuopt_int_t constraint_lower_bounds_size,
-                              const cuopt_float_t* constraint_upper_bounds,
-                              cuopt_int_t constraint_upper_bounds_size,
-                              const cuopt_float_t* variable_lower_bounds,
-                              cuopt_int_t variable_lower_bounds_size,
-                              const cuopt_float_t* variable_upper_bounds,
-                              cuopt_int_t variable_upper_bounds_size,
-                              const cuopt_float_t* objective_offsets,
-                              cuopt_int_t objective_offsets_size,
-                              cuOptSolution* solution_ptr)
+namespace {
+
+cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
+                                  cuOptSolverSettings settings,
+                                  cuopt_int_t batch_size,
+                                  const cuopt_float_t* objective_coefficients,
+                                  cuopt_int_t objective_coefficients_size,
+                                  const cuopt_float_t* constraint_lower_bounds,
+                                  cuopt_int_t constraint_lower_bounds_size,
+                                  const cuopt_float_t* constraint_upper_bounds,
+                                  cuopt_int_t constraint_upper_bounds_size,
+                                  const cuopt_float_t* variable_lower_bounds,
+                                  cuopt_int_t variable_lower_bounds_size,
+                                  const cuopt_float_t* variable_upper_bounds,
+                                  cuopt_int_t variable_upper_bounds_size,
+                                  const cuopt_float_t* objective_offsets,
+                                  cuopt_int_t objective_offsets_size,
+                                  cuOptSolution* solution_ptr,
+                                  bool input_on_device)
 {
   cuopt::utilities::printTimestamp("CUOPT_BATCH_SOLVE_START");
 
@@ -1005,32 +1031,70 @@ cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
   auto stream = problem_and_stream_view->get_handle_ptr()->get_stream();
   try {
     if (objective_coefficients_size > 0) {
-      assign_device_uvector_from_host(gpu_problem->get_objective_coefficients(),
-                                      objective_coefficients,
-                                      objective_coefficients_size,
-                                      stream);
+      if (input_on_device) {
+        assign_device_uvector_from_device(gpu_problem->get_objective_coefficients(),
+                                          objective_coefficients,
+                                          objective_coefficients_size,
+                                          stream);
+      } else {
+        assign_device_uvector_from_host(gpu_problem->get_objective_coefficients(),
+                                        objective_coefficients,
+                                        objective_coefficients_size,
+                                        stream);
+      }
     }
     if (constraint_lower_bounds_size > 0) {
-      assign_device_uvector_from_host(gpu_problem->get_constraint_lower_bounds(),
-                                      constraint_lower_bounds,
-                                      constraint_lower_bounds_size,
-                                      stream);
+      if (input_on_device) {
+        assign_device_uvector_from_device(gpu_problem->get_constraint_lower_bounds(),
+                                          constraint_lower_bounds,
+                                          constraint_lower_bounds_size,
+                                          stream);
+      } else {
+        assign_device_uvector_from_host(gpu_problem->get_constraint_lower_bounds(),
+                                        constraint_lower_bounds,
+                                        constraint_lower_bounds_size,
+                                        stream);
+      }
     }
     if (constraint_upper_bounds_size > 0) {
-      assign_device_uvector_from_host(gpu_problem->get_constraint_upper_bounds(),
-                                      constraint_upper_bounds,
-                                      constraint_upper_bounds_size,
-                                      stream);
+      if (input_on_device) {
+        assign_device_uvector_from_device(gpu_problem->get_constraint_upper_bounds(),
+                                          constraint_upper_bounds,
+                                          constraint_upper_bounds_size,
+                                          stream);
+      } else {
+        assign_device_uvector_from_host(gpu_problem->get_constraint_upper_bounds(),
+                                        constraint_upper_bounds,
+                                        constraint_upper_bounds_size,
+                                        stream);
+      }
     }
     if (objective_offsets_size > 0) {
-      gpu_problem->set_batch_objective_offsets(
-        std::vector<cuopt_float_t>(objective_offsets, objective_offsets + objective_offsets_size));
+      if (input_on_device) {
+        gpu_problem->set_batch_objective_offsets(
+          copy_device_to_host_vector(objective_offsets, objective_offsets_size, stream));
+      } else {
+        gpu_problem->set_batch_objective_offsets(std::vector<cuopt_float_t>(
+          objective_offsets, objective_offsets + objective_offsets_size));
+      }
     }
 
     auto pdlp_settings = get_settings_handle(settings)->settings->get_pdlp_settings();
     pdlp_settings.generate_batch_primal_dual_solution = true;
     pdlp_settings.fixed_batch_size                    = batch_size;
     pdlp_settings.new_bounds.clear();
+    std::vector<cuopt_float_t> variable_lower_bounds_host;
+    std::vector<cuopt_float_t> variable_upper_bounds_host;
+    const cuopt_float_t* variable_lower_bounds_read = variable_lower_bounds;
+    const cuopt_float_t* variable_upper_bounds_read = variable_upper_bounds;
+    if (input_on_device && variable_lower_bounds_size > 0) {
+      variable_lower_bounds_host =
+        copy_device_to_host_vector(variable_lower_bounds, variable_lower_bounds_size, stream);
+      variable_upper_bounds_host =
+        copy_device_to_host_vector(variable_upper_bounds, variable_upper_bounds_size, stream);
+      variable_lower_bounds_read = variable_lower_bounds_host.data();
+      variable_upper_bounds_read = variable_upper_bounds_host.data();
+    }
     if (variable_lower_bounds_size > 0) {
       for (cuopt_int_t batch = 0; batch < batch_size; ++batch) {
         for (cuopt_int_t var = 0; var < n_vars; ++var) {
@@ -1038,8 +1102,8 @@ cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
             variable_lower_bounds_size == n_vars ? var : batch * n_vars + var;
           const cuopt_int_t upper_index =
             variable_upper_bounds_size == n_vars ? var : batch * n_vars + var;
-          const cuopt_float_t lower = variable_lower_bounds[lower_index];
-          const cuopt_float_t upper = variable_upper_bounds[upper_index];
+          const cuopt_float_t lower = variable_lower_bounds_read[lower_index];
+          const cuopt_float_t upper = variable_upper_bounds_read[upper_index];
           pdlp_settings.new_bounds.push_back({batch, var, lower, upper});
         }
       }
@@ -1063,6 +1127,80 @@ cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
     CUOPT_LOG_ERROR("Batch solve failed with exception: %s", e.what());
     return CUOPT_RUNTIME_ERROR;
   }
+}
+
+}  // namespace
+
+cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
+                              cuOptSolverSettings settings,
+                              cuopt_int_t batch_size,
+                              const cuopt_float_t* objective_coefficients,
+                              cuopt_int_t objective_coefficients_size,
+                              const cuopt_float_t* constraint_lower_bounds,
+                              cuopt_int_t constraint_lower_bounds_size,
+                              const cuopt_float_t* constraint_upper_bounds,
+                              cuopt_int_t constraint_upper_bounds_size,
+                              const cuopt_float_t* variable_lower_bounds,
+                              cuopt_int_t variable_lower_bounds_size,
+                              const cuopt_float_t* variable_upper_bounds,
+                              cuopt_int_t variable_upper_bounds_size,
+                              const cuopt_float_t* objective_offsets,
+                              cuopt_int_t objective_offsets_size,
+                              cuOptSolution* solution_ptr)
+{
+  return cuOptSolveBatchLPImpl(problem,
+                               settings,
+                               batch_size,
+                               objective_coefficients,
+                               objective_coefficients_size,
+                               constraint_lower_bounds,
+                               constraint_lower_bounds_size,
+                               constraint_upper_bounds,
+                               constraint_upper_bounds_size,
+                               variable_lower_bounds,
+                               variable_lower_bounds_size,
+                               variable_upper_bounds,
+                               variable_upper_bounds_size,
+                               objective_offsets,
+                               objective_offsets_size,
+                               solution_ptr,
+                               false);
+}
+
+cuopt_int_t cuOptSolveBatchLPDeviceData(cuOptOptimizationProblem problem,
+                                        cuOptSolverSettings settings,
+                                        cuopt_int_t batch_size,
+                                        const cuopt_float_t* objective_coefficients,
+                                        cuopt_int_t objective_coefficients_size,
+                                        const cuopt_float_t* constraint_lower_bounds,
+                                        cuopt_int_t constraint_lower_bounds_size,
+                                        const cuopt_float_t* constraint_upper_bounds,
+                                        cuopt_int_t constraint_upper_bounds_size,
+                                        const cuopt_float_t* variable_lower_bounds,
+                                        cuopt_int_t variable_lower_bounds_size,
+                                        const cuopt_float_t* variable_upper_bounds,
+                                        cuopt_int_t variable_upper_bounds_size,
+                                        const cuopt_float_t* objective_offsets,
+                                        cuopt_int_t objective_offsets_size,
+                                        cuOptSolution* solution_ptr)
+{
+  return cuOptSolveBatchLPImpl(problem,
+                               settings,
+                               batch_size,
+                               objective_coefficients,
+                               objective_coefficients_size,
+                               constraint_lower_bounds,
+                               constraint_lower_bounds_size,
+                               constraint_upper_bounds,
+                               constraint_upper_bounds_size,
+                               variable_lower_bounds,
+                               variable_lower_bounds_size,
+                               variable_upper_bounds,
+                               variable_upper_bounds_size,
+                               objective_offsets,
+                               objective_offsets_size,
+                               solution_ptr,
+                               true);
 }
 
 void cuOptDestroySolution(cuOptSolution* solution_ptr)
