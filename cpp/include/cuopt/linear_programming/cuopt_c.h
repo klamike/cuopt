@@ -845,6 +845,55 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
                        cuOptSolverSettings settings,
                        cuOptSolution* solution_ptr);
 
+/** @brief Solve a fixed-size batch of LPs sharing a constraint matrix.
+ *
+ * Optional per-batch arrays may be NULL with size 0. Non-NULL arrays must have
+ * either the scalar problem size (shared across the batch) or batch_size times
+ * the scalar problem size (contiguous block per batch member). Variable bounds
+ * are passed as lower/upper arrays and are applied as per-batch bound overrides.
+ *
+ * This API requires a GPU-backed LP problem and uses the cuOpt batch PDLP path.
+ */
+cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
+                              cuOptSolverSettings settings,
+                              cuopt_int_t batch_size,
+                              const cuopt_float_t* objective_coefficients,
+                              cuopt_int_t objective_coefficients_size,
+                              const cuopt_float_t* constraint_lower_bounds,
+                              cuopt_int_t constraint_lower_bounds_size,
+                              const cuopt_float_t* constraint_upper_bounds,
+                              cuopt_int_t constraint_upper_bounds_size,
+                              const cuopt_float_t* variable_lower_bounds,
+                              cuopt_int_t variable_lower_bounds_size,
+                              const cuopt_float_t* variable_upper_bounds,
+                              cuopt_int_t variable_upper_bounds_size,
+                              const cuopt_float_t* objective_offsets,
+                              cuopt_int_t objective_offsets_size,
+                              cuOptSolution* solution_ptr);
+
+/** @brief Get the number of LPs represented by a batch solution. */
+cuopt_int_t cuOptGetBatchSize(cuOptSolution solution, cuopt_int_t* batch_size_ptr);
+
+/** @brief Get the termination status for a 0-based batch member. */
+cuopt_int_t cuOptGetBatchTerminationStatus(cuOptSolution solution,
+                                           cuopt_int_t batch_index,
+                                           cuopt_int_t* termination_status_ptr);
+
+/** @brief Get the objective value for a 0-based batch member. */
+cuopt_int_t cuOptGetBatchObjectiveValue(cuOptSolution solution,
+                                        cuopt_int_t batch_index,
+                                        cuopt_float_t* objective_value_ptr);
+
+/** @brief Get the primal solution for a 0-based batch member. */
+cuopt_int_t cuOptGetBatchPrimalSolution(cuOptSolution solution,
+                                        cuopt_int_t batch_index,
+                                        cuopt_float_t* solution_values);
+
+/** @brief Get the dual solution for a 0-based batch member. */
+cuopt_int_t cuOptGetBatchDualSolution(cuOptSolution solution,
+                                      cuopt_int_t batch_index,
+                                      cuopt_float_t* dual_solution_ptr);
+
 /** @brief Destroy a solution object.
  *
  * @param[in, out] solution_ptr - A pointer to a cuOptSolution object. On output

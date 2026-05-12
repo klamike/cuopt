@@ -15,13 +15,17 @@
 #include <cuopt/linear_programming/solver_settings.hpp>
 #include <cuopt/utilities/timestamp_utils.hpp>
 #include <pdlp/cuopt_c_internal.hpp>
+#include <pdlp/solve.cuh>
 #include <utilities/logger.hpp>
 
 #include <mps_parser/parser.hpp>
 
 #include <cuopt/version_config.hpp>
 
+#include <raft/core/copy.hpp>
+
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -80,6 +84,28 @@ struct solver_settings_handle_t {
 solver_settings_handle_t* get_settings_handle(cuOptSolverSettings settings)
 {
   return static_cast<solver_settings_handle_t*>(settings);
+}
+
+template <typename T>
+void assign_device_uvector_from_host(rmm::device_uvector<T>& target,
+                                     const T* source,
+                                     std::size_t size,
+                                     rmm::cuda_stream_view stream)
+{
+  target.resize(size, stream);
+  if (size > 0) { raft::copy(target.data(), source, size, stream); }
+}
+
+bool valid_optional_array(const cuopt_float_t* values, cuopt_int_t size)
+{
+  if (size < 0) { return false; }
+  return size == 0 || values != nullptr;
+}
+
+bool valid_shared_or_batched_size(cuopt_int_t size, cuopt_int_t shared_size, cuopt_int_t batch_size)
+{
+  if (size < 0) { return false; }
+  return size == 0 || size == shared_size || size == shared_size * batch_size;
 }
 
 int8_t cuOptGetFloatSize() { return sizeof(cuopt_float_t); }
@@ -898,6 +924,8 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
       auto solution_holder = std::make_unique<solution_and_stream_view_t>(
         false, problem_and_stream_view->memory_backend);
       solution_holder->lp_solution_interface_ptr = solution_interface.release();
+      solution_holder->num_variables             = problem_interface->get_n_variables();
+      solution_holder->num_constraints           = problem_interface->get_n_constraints();
 
       cuopt::utilities::printTimestamp("CUOPT_SOLVE_RETURN");
 
@@ -912,6 +940,127 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
     return static_cast<cuopt_int_t>(e.get_error_type());
   } catch (const std::exception& e) {
     CUOPT_LOG_ERROR("Solve failed with exception: %s", e.what());
+    return CUOPT_RUNTIME_ERROR;
+  }
+}
+
+cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
+                              cuOptSolverSettings settings,
+                              cuopt_int_t batch_size,
+                              const cuopt_float_t* objective_coefficients,
+                              cuopt_int_t objective_coefficients_size,
+                              const cuopt_float_t* constraint_lower_bounds,
+                              cuopt_int_t constraint_lower_bounds_size,
+                              const cuopt_float_t* constraint_upper_bounds,
+                              cuopt_int_t constraint_upper_bounds_size,
+                              const cuopt_float_t* variable_lower_bounds,
+                              cuopt_int_t variable_lower_bounds_size,
+                              const cuopt_float_t* variable_upper_bounds,
+                              cuopt_int_t variable_upper_bounds_size,
+                              const cuopt_float_t* objective_offsets,
+                              cuopt_int_t objective_offsets_size,
+                              cuOptSolution* solution_ptr)
+{
+  cuopt::utilities::printTimestamp("CUOPT_BATCH_SOLVE_START");
+
+  if (problem == nullptr || settings == nullptr || solution_ptr == nullptr) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  if (batch_size <= 0) { return CUOPT_INVALID_ARGUMENT; }
+  if (!valid_optional_array(objective_coefficients, objective_coefficients_size) ||
+      !valid_optional_array(constraint_lower_bounds, constraint_lower_bounds_size) ||
+      !valid_optional_array(constraint_upper_bounds, constraint_upper_bounds_size) ||
+      !valid_optional_array(variable_lower_bounds, variable_lower_bounds_size) ||
+      !valid_optional_array(variable_upper_bounds, variable_upper_bounds_size) ||
+      !valid_optional_array(objective_offsets, objective_offsets_size)) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+
+  problem_and_stream_view_t* problem_and_stream_view =
+    static_cast<problem_and_stream_view_t*>(problem);
+  if (problem_and_stream_view->memory_backend != memory_backend_t::GPU) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  auto* gpu_problem = problem_and_stream_view->get_gpu_problem();
+  if (gpu_problem == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  if (gpu_problem->get_problem_category() != problem_category_t::LP) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+
+  const cuopt_int_t n_vars        = gpu_problem->get_n_variables();
+  const cuopt_int_t n_constraints = gpu_problem->get_n_constraints();
+  if (!valid_shared_or_batched_size(objective_coefficients_size, n_vars, batch_size) ||
+      !valid_shared_or_batched_size(
+        constraint_lower_bounds_size, n_constraints, batch_size) ||
+      !valid_shared_or_batched_size(
+        constraint_upper_bounds_size, n_constraints, batch_size) ||
+      constraint_lower_bounds_size != constraint_upper_bounds_size ||
+      !valid_shared_or_batched_size(variable_lower_bounds_size, n_vars, batch_size) ||
+      !valid_shared_or_batched_size(variable_upper_bounds_size, n_vars, batch_size) ||
+      variable_lower_bounds_size != variable_upper_bounds_size ||
+      (objective_offsets_size != 0 && objective_offsets_size != batch_size)) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+
+  auto stream = problem_and_stream_view->get_handle_ptr()->get_stream();
+  try {
+    if (objective_coefficients_size > 0) {
+      assign_device_uvector_from_host(gpu_problem->get_objective_coefficients(),
+                                      objective_coefficients,
+                                      objective_coefficients_size,
+                                      stream);
+    }
+    if (constraint_lower_bounds_size > 0) {
+      assign_device_uvector_from_host(gpu_problem->get_constraint_lower_bounds(),
+                                      constraint_lower_bounds,
+                                      constraint_lower_bounds_size,
+                                      stream);
+    }
+    if (constraint_upper_bounds_size > 0) {
+      assign_device_uvector_from_host(gpu_problem->get_constraint_upper_bounds(),
+                                      constraint_upper_bounds,
+                                      constraint_upper_bounds_size,
+                                      stream);
+    }
+    if (objective_offsets_size > 0) {
+      gpu_problem->set_batch_objective_offsets(
+        std::vector<cuopt_float_t>(objective_offsets, objective_offsets + objective_offsets_size));
+    }
+
+    auto pdlp_settings = get_settings_handle(settings)->settings->get_pdlp_settings();
+    pdlp_settings.generate_batch_primal_dual_solution = true;
+    pdlp_settings.fixed_batch_size                    = batch_size;
+    pdlp_settings.new_bounds.clear();
+    if (variable_lower_bounds_size > 0) {
+      for (cuopt_int_t batch = 0; batch < batch_size; ++batch) {
+        for (cuopt_int_t var = 0; var < n_vars; ++var) {
+          const cuopt_int_t lower_index =
+            variable_lower_bounds_size == n_vars ? var : batch * n_vars + var;
+          const cuopt_int_t upper_index =
+            variable_upper_bounds_size == n_vars ? var : batch * n_vars + var;
+          const cuopt_float_t lower = variable_lower_bounds[lower_index];
+          const cuopt_float_t upper = variable_upper_bounds[upper_index];
+          pdlp_settings.new_bounds.push_back({batch, var, lower, upper});
+        }
+      }
+    }
+
+    auto batch_solution = run_batch_pdlp(*gpu_problem, pdlp_settings);
+    auto solution_holder = std::make_unique<solution_and_stream_view_t>(
+      false, problem_and_stream_view->memory_backend);
+    solution_holder->lp_solution_interface_ptr =
+      new gpu_lp_solution_t<cuopt_int_t, cuopt_float_t>(std::move(batch_solution));
+    solution_holder->batch_size      = batch_size;
+    solution_holder->num_variables   = n_vars;
+    solution_holder->num_constraints = n_constraints;
+    *solution_ptr = static_cast<cuOptSolution>(solution_holder.release());
+    cuopt::utilities::printTimestamp("CUOPT_BATCH_SOLVE_RETURN");
+    return CUOPT_SUCCESS;
+  } catch (const cuopt::logic_error& e) {
+    CUOPT_LOG_ERROR("Batch solve failed: %s", e.what());
+    return static_cast<cuopt_int_t>(e.get_error_type());
+  } catch (const std::exception& e) {
+    CUOPT_LOG_ERROR("Batch solve failed with exception: %s", e.what());
     return CUOPT_RUNTIME_ERROR;
   }
 }
@@ -935,6 +1084,93 @@ cuopt_int_t cuOptGetTerminationStatus(cuOptSolution solution, cuopt_int_t* termi
     static_cast<solution_and_stream_view_t*>(solution);
   *termination_status_ptr = static_cast<cuopt_int_t>(
     solution_and_stream_view->get_solution()->get_termination_status_int());
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetBatchSize(cuOptSolution solution, cuopt_int_t* batch_size_ptr)
+{
+  if (solution == nullptr || batch_size_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  solution_and_stream_view_t* solution_and_stream_view =
+    static_cast<solution_and_stream_view_t*>(solution);
+  if (solution_and_stream_view->is_mip) { return CUOPT_INVALID_ARGUMENT; }
+  *batch_size_ptr = solution_and_stream_view->batch_size;
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetBatchTerminationStatus(cuOptSolution solution,
+                                           cuopt_int_t batch_index,
+                                           cuopt_int_t* termination_status_ptr)
+{
+  if (solution == nullptr || termination_status_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  solution_and_stream_view_t* solution_and_stream_view =
+    static_cast<solution_and_stream_view_t*>(solution);
+  if (solution_and_stream_view->is_mip || batch_index < 0 ||
+      batch_index >= solution_and_stream_view->batch_size) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  *termination_status_ptr = static_cast<cuopt_int_t>(
+    solution_and_stream_view->lp_solution_interface_ptr->get_termination_status(batch_index));
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetBatchObjectiveValue(cuOptSolution solution,
+                                        cuopt_int_t batch_index,
+                                        cuopt_float_t* objective_value_ptr)
+{
+  if (solution == nullptr || objective_value_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  solution_and_stream_view_t* solution_and_stream_view =
+    static_cast<solution_and_stream_view_t*>(solution);
+  if (solution_and_stream_view->is_mip || batch_index < 0 ||
+      batch_index >= solution_and_stream_view->batch_size) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  *objective_value_ptr =
+    solution_and_stream_view->lp_solution_interface_ptr->get_objective_value(batch_index);
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetBatchPrimalSolution(cuOptSolution solution,
+                                        cuopt_int_t batch_index,
+                                        cuopt_float_t* solution_values_ptr)
+{
+  if (solution == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  solution_and_stream_view_t* solution_and_stream_view =
+    static_cast<solution_and_stream_view_t*>(solution);
+  if (solution_and_stream_view->is_mip || batch_index < 0 ||
+      batch_index >= solution_and_stream_view->batch_size) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  const auto solution_host =
+    solution_and_stream_view->lp_solution_interface_ptr->get_primal_solution_host();
+  const auto n = static_cast<std::size_t>(solution_and_stream_view->num_variables);
+  if (n > 0 && solution_values_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  if (n > 0) {
+    std::memcpy(solution_values_ptr,
+                solution_host.data() + static_cast<std::size_t>(batch_index) * n,
+                n * sizeof(cuopt_float_t));
+  }
+  return CUOPT_SUCCESS;
+}
+
+cuopt_int_t cuOptGetBatchDualSolution(cuOptSolution solution,
+                                      cuopt_int_t batch_index,
+                                      cuopt_float_t* dual_solution_ptr)
+{
+  if (solution == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  solution_and_stream_view_t* solution_and_stream_view =
+    static_cast<solution_and_stream_view_t*>(solution);
+  if (solution_and_stream_view->is_mip || batch_index < 0 ||
+      batch_index >= solution_and_stream_view->batch_size) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  const auto dual_host = solution_and_stream_view->lp_solution_interface_ptr->get_dual_solution();
+  const auto n = static_cast<std::size_t>(solution_and_stream_view->num_constraints);
+  if (n > 0 && dual_solution_ptr == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  if (n > 0) {
+    std::memcpy(dual_solution_ptr,
+                dual_host.data() + static_cast<std::size_t>(batch_index) * n,
+                n * sizeof(cuopt_float_t));
+  }
   return CUOPT_SUCCESS;
 }
 

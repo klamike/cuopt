@@ -125,7 +125,10 @@ struct solution_and_stream_view_t {
     : is_mip(solution_for_mip),
       mip_solution_interface_ptr(nullptr),
       lp_solution_interface_ptr(nullptr),
-      memory_backend(mem_backend)
+      memory_backend(mem_backend),
+      batch_size(1),
+      num_variables(0),
+      num_constraints(0)
   {
   }
 
@@ -138,7 +141,10 @@ struct solution_and_stream_view_t {
     : is_mip(other.is_mip),
       mip_solution_interface_ptr(other.mip_solution_interface_ptr),
       lp_solution_interface_ptr(other.lp_solution_interface_ptr),
-      memory_backend(other.memory_backend)
+      memory_backend(other.memory_backend),
+      batch_size(other.batch_size),
+      num_variables(other.num_variables),
+      num_constraints(other.num_constraints)
   {
     other.mip_solution_interface_ptr = nullptr;
     other.lp_solution_interface_ptr  = nullptr;
@@ -154,6 +160,9 @@ struct solution_and_stream_view_t {
       mip_solution_interface_ptr = other.mip_solution_interface_ptr;
       lp_solution_interface_ptr  = other.lp_solution_interface_ptr;
       memory_backend             = other.memory_backend;
+      batch_size                 = other.batch_size;
+      num_variables              = other.num_variables;
+      num_constraints            = other.num_constraints;
 
       other.mip_solution_interface_ptr = nullptr;
       other.lp_solution_interface_ptr  = nullptr;
@@ -185,6 +194,9 @@ struct solution_and_stream_view_t {
   mip_solution_interface_t<cuopt_int_t, cuopt_float_t>* mip_solution_interface_ptr;
   lp_solution_interface_t<cuopt_int_t, cuopt_float_t>* lp_solution_interface_ptr;
   memory_backend_t memory_backend;  // Track if GPU or CPU memory for data access
+  cuopt_int_t batch_size;
+  cuopt_int_t num_variables;
+  cuopt_int_t num_constraints;
 };
 
 }  // namespace cuopt::linear_programming
