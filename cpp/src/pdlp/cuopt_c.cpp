@@ -969,35 +969,23 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
 
 namespace {
 
-cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
-                                  cuOptSolverSettings settings,
-                                  cuopt_int_t batch_size,
-                                  const cuopt_float_t* objective_coefficients,
-                                  cuopt_int_t objective_coefficients_size,
-                                  const cuopt_float_t* constraint_lower_bounds,
-                                  cuopt_int_t constraint_lower_bounds_size,
-                                  const cuopt_float_t* constraint_upper_bounds,
-                                  cuopt_int_t constraint_upper_bounds_size,
-                                  const cuopt_float_t* variable_lower_bounds,
-                                  cuopt_int_t variable_lower_bounds_size,
-                                  const cuopt_float_t* variable_upper_bounds,
-                                  cuopt_int_t variable_upper_bounds_size,
-                                  const cuopt_float_t* objective_offsets,
-                                  cuopt_int_t objective_offsets_size,
-                                  cuOptSolution* solution_ptr,
-                                  bool input_on_device)
+cuopt_int_t cuOptLoadBatchLPDataImpl(cuOptOptimizationProblem problem,
+                                     cuopt_int_t batch_size,
+                                     const cuopt_float_t* objective_coefficients,
+                                     cuopt_int_t objective_coefficients_size,
+                                     const cuopt_float_t* constraint_lower_bounds,
+                                     cuopt_int_t constraint_lower_bounds_size,
+                                     const cuopt_float_t* constraint_upper_bounds,
+                                     cuopt_int_t constraint_upper_bounds_size,
+                                     const cuopt_float_t* objective_offsets,
+                                     cuopt_int_t objective_offsets_size,
+                                     bool input_on_device)
 {
-  cuopt::utilities::printTimestamp("CUOPT_BATCH_SOLVE_START");
-
-  if (problem == nullptr || settings == nullptr || solution_ptr == nullptr) {
-    return CUOPT_INVALID_ARGUMENT;
-  }
+  if (problem == nullptr) { return CUOPT_INVALID_ARGUMENT; }
   if (batch_size <= 0) { return CUOPT_INVALID_ARGUMENT; }
   if (!valid_optional_array(objective_coefficients, objective_coefficients_size) ||
       !valid_optional_array(constraint_lower_bounds, constraint_lower_bounds_size) ||
       !valid_optional_array(constraint_upper_bounds, constraint_upper_bounds_size) ||
-      !valid_optional_array(variable_lower_bounds, variable_lower_bounds_size) ||
-      !valid_optional_array(variable_upper_bounds, variable_upper_bounds_size) ||
       !valid_optional_array(objective_offsets, objective_offsets_size)) {
     return CUOPT_INVALID_ARGUMENT;
   }
@@ -1021,9 +1009,6 @@ cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
       !valid_shared_or_batched_size(
         constraint_upper_bounds_size, n_constraints, batch_size) ||
       constraint_lower_bounds_size != constraint_upper_bounds_size ||
-      !valid_shared_or_batched_size(variable_lower_bounds_size, n_vars, batch_size) ||
-      !valid_shared_or_batched_size(variable_upper_bounds_size, n_vars, batch_size) ||
-      variable_lower_bounds_size != variable_upper_bounds_size ||
       (objective_offsets_size != 0 && objective_offsets_size != batch_size)) {
     return CUOPT_INVALID_ARGUMENT;
   }
@@ -1078,7 +1063,82 @@ cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
           objective_offsets, objective_offsets + objective_offsets_size));
       }
     }
+    return CUOPT_SUCCESS;
+  } catch (const cuopt::logic_error& e) {
+    CUOPT_LOG_ERROR("Batch data load failed: %s", e.what());
+    return static_cast<cuopt_int_t>(e.get_error_type());
+  } catch (const std::exception& e) {
+    CUOPT_LOG_ERROR("Batch data load failed with exception: %s", e.what());
+    return CUOPT_RUNTIME_ERROR;
+  }
+}
 
+cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
+                                  cuOptSolverSettings settings,
+                                  cuopt_int_t batch_size,
+                                  const cuopt_float_t* objective_coefficients,
+                                  cuopt_int_t objective_coefficients_size,
+                                  const cuopt_float_t* constraint_lower_bounds,
+                                  cuopt_int_t constraint_lower_bounds_size,
+                                  const cuopt_float_t* constraint_upper_bounds,
+                                  cuopt_int_t constraint_upper_bounds_size,
+                                  const cuopt_float_t* variable_lower_bounds,
+                                  cuopt_int_t variable_lower_bounds_size,
+                                  const cuopt_float_t* variable_upper_bounds,
+                                  cuopt_int_t variable_upper_bounds_size,
+                                  const cuopt_float_t* objective_offsets,
+                                  cuopt_int_t objective_offsets_size,
+                                  cuOptSolution* solution_ptr,
+                                  bool input_on_device)
+{
+  cuopt::utilities::printTimestamp("CUOPT_BATCH_SOLVE_START");
+
+  if (problem == nullptr || settings == nullptr || solution_ptr == nullptr) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  if (batch_size <= 0) { return CUOPT_INVALID_ARGUMENT; }
+  if (!valid_optional_array(objective_coefficients, objective_coefficients_size) ||
+      !valid_optional_array(constraint_lower_bounds, constraint_lower_bounds_size) ||
+      !valid_optional_array(constraint_upper_bounds, constraint_upper_bounds_size) ||
+      !valid_optional_array(variable_lower_bounds, variable_lower_bounds_size) ||
+      !valid_optional_array(variable_upper_bounds, variable_upper_bounds_size) ||
+      !valid_optional_array(objective_offsets, objective_offsets_size)) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+
+  problem_and_stream_view_t* problem_and_stream_view =
+    static_cast<problem_and_stream_view_t*>(problem);
+  if (problem_and_stream_view->memory_backend != memory_backend_t::GPU) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  auto* gpu_problem = problem_and_stream_view->get_gpu_problem();
+  if (gpu_problem == nullptr) { return CUOPT_INVALID_ARGUMENT; }
+  if (gpu_problem->get_problem_category() != problem_category_t::LP) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+
+  const cuopt_int_t n_vars        = gpu_problem->get_n_variables();
+  const cuopt_int_t n_constraints = gpu_problem->get_n_constraints();
+  if (!valid_shared_or_batched_size(variable_lower_bounds_size, n_vars, batch_size) ||
+      !valid_shared_or_batched_size(variable_upper_bounds_size, n_vars, batch_size) ||
+      variable_lower_bounds_size != variable_upper_bounds_size) {
+    return CUOPT_INVALID_ARGUMENT;
+  }
+  const cuopt_int_t load_status = cuOptLoadBatchLPDataImpl(problem,
+                                                           batch_size,
+                                                           objective_coefficients,
+                                                           objective_coefficients_size,
+                                                           constraint_lower_bounds,
+                                                           constraint_lower_bounds_size,
+                                                           constraint_upper_bounds,
+                                                           constraint_upper_bounds_size,
+                                                           objective_offsets,
+                                                           objective_offsets_size,
+                                                           input_on_device);
+  if (load_status != CUOPT_SUCCESS) { return load_status; }
+
+  auto stream = problem_and_stream_view->get_handle_ptr()->get_stream();
+  try {
     auto pdlp_settings = get_settings_handle(settings)->settings->get_pdlp_settings();
     pdlp_settings.generate_batch_primal_dual_solution = true;
     pdlp_settings.fixed_batch_size                    = batch_size;
@@ -1130,6 +1190,54 @@ cuopt_int_t cuOptSolveBatchLPImpl(cuOptOptimizationProblem problem,
 }
 
 }  // namespace
+
+cuopt_int_t cuOptLoadBatchLPData(cuOptOptimizationProblem problem,
+                                 cuopt_int_t batch_size,
+                                 const cuopt_float_t* objective_coefficients,
+                                 cuopt_int_t objective_coefficients_size,
+                                 const cuopt_float_t* constraint_lower_bounds,
+                                 cuopt_int_t constraint_lower_bounds_size,
+                                 const cuopt_float_t* constraint_upper_bounds,
+                                 cuopt_int_t constraint_upper_bounds_size,
+                                 const cuopt_float_t* objective_offsets,
+                                 cuopt_int_t objective_offsets_size)
+{
+  return cuOptLoadBatchLPDataImpl(problem,
+                                  batch_size,
+                                  objective_coefficients,
+                                  objective_coefficients_size,
+                                  constraint_lower_bounds,
+                                  constraint_lower_bounds_size,
+                                  constraint_upper_bounds,
+                                  constraint_upper_bounds_size,
+                                  objective_offsets,
+                                  objective_offsets_size,
+                                  false);
+}
+
+cuopt_int_t cuOptLoadBatchLPDeviceData(cuOptOptimizationProblem problem,
+                                       cuopt_int_t batch_size,
+                                       const cuopt_float_t* objective_coefficients,
+                                       cuopt_int_t objective_coefficients_size,
+                                       const cuopt_float_t* constraint_lower_bounds,
+                                       cuopt_int_t constraint_lower_bounds_size,
+                                       const cuopt_float_t* constraint_upper_bounds,
+                                       cuopt_int_t constraint_upper_bounds_size,
+                                       const cuopt_float_t* objective_offsets,
+                                       cuopt_int_t objective_offsets_size)
+{
+  return cuOptLoadBatchLPDataImpl(problem,
+                                  batch_size,
+                                  objective_coefficients,
+                                  objective_coefficients_size,
+                                  constraint_lower_bounds,
+                                  constraint_lower_bounds_size,
+                                  constraint_upper_bounds,
+                                  constraint_upper_bounds_size,
+                                  objective_offsets,
+                                  objective_offsets_size,
+                                  true);
+}
 
 cuopt_int_t cuOptSolveBatchLP(cuOptOptimizationProblem problem,
                               cuOptSolverSettings settings,

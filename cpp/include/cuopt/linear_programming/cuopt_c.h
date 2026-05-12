@@ -845,6 +845,37 @@ cuopt_int_t cuOptSolve(cuOptOptimizationProblem problem,
                        cuOptSolverSettings settings,
                        cuOptSolution* solution_ptr);
 
+/** @brief Load fixed-size batch LP data without solving.
+ *
+ * Optional per-batch arrays may be NULL with size 0. Non-NULL arrays must have
+ * either the scalar problem size (shared across the batch) or batch_size times
+ * the scalar problem size (contiguous block per batch member). The loaded data
+ * is stored on the GPU-backed optimization problem and reused by
+ * cuOptSolveBatchLP when the corresponding array size is passed as 0.
+ */
+cuopt_int_t cuOptLoadBatchLPData(cuOptOptimizationProblem problem,
+                                 cuopt_int_t batch_size,
+                                 const cuopt_float_t* objective_coefficients,
+                                 cuopt_int_t objective_coefficients_size,
+                                 const cuopt_float_t* constraint_lower_bounds,
+                                 cuopt_int_t constraint_lower_bounds_size,
+                                 const cuopt_float_t* constraint_upper_bounds,
+                                 cuopt_int_t constraint_upper_bounds_size,
+                                 const cuopt_float_t* objective_offsets,
+                                 cuopt_int_t objective_offsets_size);
+
+/** @brief Load fixed-size batch LP data from device-resident arrays. */
+cuopt_int_t cuOptLoadBatchLPDeviceData(cuOptOptimizationProblem problem,
+                                       cuopt_int_t batch_size,
+                                       const cuopt_float_t* objective_coefficients,
+                                       cuopt_int_t objective_coefficients_size,
+                                       const cuopt_float_t* constraint_lower_bounds,
+                                       cuopt_int_t constraint_lower_bounds_size,
+                                       const cuopt_float_t* constraint_upper_bounds,
+                                       cuopt_int_t constraint_upper_bounds_size,
+                                       const cuopt_float_t* objective_offsets,
+                                       cuopt_int_t objective_offsets_size);
+
 /** @brief Solve a fixed-size batch of LPs sharing a constraint matrix.
  *
  * Optional per-batch arrays may be NULL with size 0. Non-NULL arrays must have
