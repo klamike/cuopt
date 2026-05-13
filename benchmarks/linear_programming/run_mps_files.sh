@@ -18,6 +18,9 @@
 #   --output-dir  : Directory to store output log files (default: current directory)
 #   --relaxation  : Run relaxation instead of solving the MIP
 #   --mip-heuristics-only : Run mip heuristics only
+#   --mip-batch-pdlp-strong-branching : Enable cuOpt MIP batch strong branching mode
+#   --mip-batch-pdlp-reliability-branching : Enable cuOpt MIP batch reliability branching mode
+#   --mip-batch-branch-solver : Batch LP backend for MIP branching: 0=PDLP, 1=MadIPM/libMad
 #   --write-log-file : Write log file
 #   --num-cpu-threads : Number of CPU threads to use
 #   --presolve : Enable presolve (default: true for MIP problems, false for LP problems)
@@ -67,6 +70,12 @@ Optional Arguments:
     --output-dir PATH   Directory to store output log files (default: current directory)
     --relaxation       Run relaxation instead of solving the MIP
     --mip-heuristics-only  Run mip heuristics only
+    --mip-batch-pdlp-strong-branching N
+                         cuOpt MIP batch strong branching mode
+    --mip-batch-pdlp-reliability-branching N
+                         cuOpt MIP batch reliability branching mode
+    --mip-batch-branch-solver N
+                         Batch LP backend for MIP branching: 0=PDLP, 1=MadIPM/libMad
     --write-log-file   Write log file
     --num-cpu-threads  Number of CPU threads to use
     --presolve         Enable presolve (default: true for MIP problems, false for LP problems)
@@ -148,6 +157,21 @@ while [[ $# -gt 0 ]]; do
             MIP_HEURISTICS_ONLY=true
             shift
             ;;
+        --mip-batch-pdlp-strong-branching)
+            echo "MIP_BATCH_PDLP_STRONG_BRANCHING: $2"
+            MIP_BATCH_PDLP_STRONG_BRANCHING="$2"
+            shift 2
+            ;;
+        --mip-batch-pdlp-reliability-branching)
+            echo "MIP_BATCH_PDLP_RELIABILITY_BRANCHING: $2"
+            MIP_BATCH_PDLP_RELIABILITY_BRANCHING="$2"
+            shift 2
+            ;;
+        --mip-batch-branch-solver)
+            echo "MIP_BATCH_BRANCH_SOLVER: $2"
+            MIP_BATCH_BRANCH_SOLVER="$2"
+            shift 2
+            ;;
         --write-log-file)
             echo "WRITE_LOG_FILE: true"
             WRITE_LOG_FILE=true
@@ -214,6 +238,9 @@ TIME_LIMIT=${TIME_LIMIT:-360}
 OUTPUT_DIR=${OUTPUT_DIR:-.}
 RELAXATION=${RELAXATION:-false}
 MIP_HEURISTICS_ONLY=${MIP_HEURISTICS_ONLY:-false}
+MIP_BATCH_PDLP_STRONG_BRANCHING=${MIP_BATCH_PDLP_STRONG_BRANCHING:-}
+MIP_BATCH_PDLP_RELIABILITY_BRANCHING=${MIP_BATCH_PDLP_RELIABILITY_BRANCHING:-}
+MIP_BATCH_BRANCH_SOLVER=${MIP_BATCH_BRANCH_SOLVER:-}
 WRITE_LOG_FILE=${WRITE_LOG_FILE:-false}
 NUM_CPU_THREADS=${NUM_CPU_THREADS:--1}
 BATCH_NUM=${BATCH_NUM:-0}
@@ -403,6 +430,15 @@ worker() {
         fi
         if [ "$MIP_HEURISTICS_ONLY" = true ]; then
             args="$args --mip-heuristics-only true"
+        fi
+        if [ -n "$MIP_BATCH_PDLP_STRONG_BRANCHING" ]; then
+            args="$args --mip-batch-pdlp-strong-branching $MIP_BATCH_PDLP_STRONG_BRANCHING"
+        fi
+        if [ -n "$MIP_BATCH_PDLP_RELIABILITY_BRANCHING" ]; then
+            args="$args --mip-batch-pdlp-reliability-branching $MIP_BATCH_PDLP_RELIABILITY_BRANCHING"
+        fi
+        if [ -n "$MIP_BATCH_BRANCH_SOLVER" ]; then
+            args="$args --mip-batch-branch-solver $MIP_BATCH_BRANCH_SOLVER"
         fi
         if [ "$WRITE_LOG_FILE" = true ]; then
             args="$args --log-file $OUTPUT_DIR/$(basename "${mps_file%.mps}").log"

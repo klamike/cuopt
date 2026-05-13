@@ -468,6 +468,10 @@ class SolverConfig(BaseModel):
         "1 = cooperative work-stealing (DS + batch PDLP), "
         "2 = batch PDLP only.",
     )
+    mip_batch_branch_solver: Optional[int] = Field(
+        default=0,
+        description="Batch branching backend: 0 = PDLP, 1 = MadIPM/libMad.",
+    )
     num_cpu_threads: Optional[int] = Field(
         default=None,
         description="Set the number of CPU threads to use in the MIP solver",  # noqa

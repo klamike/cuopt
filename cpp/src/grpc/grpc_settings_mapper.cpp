@@ -214,6 +214,9 @@ void map_mip_settings_to_proto(const mip_solver_settings_t<i_t, f_t>& settings,
   // Branching
   pb_settings->set_reliability_branching(settings.reliability_branching);
   pb_settings->set_mip_batch_pdlp_strong_branching(settings.mip_batch_pdlp_strong_branching);
+  pb_settings->set_mip_batch_pdlp_reliability_branching(
+    settings.mip_batch_pdlp_reliability_branching);
+  pb_settings->set_mip_batch_branch_solver(settings.mip_batch_branch_solver);
 
   // Cut configuration
   pb_settings->set_max_cut_passes(settings.max_cut_passes);
@@ -271,8 +274,11 @@ void map_proto_to_mip_settings(const cuopt::remote::MIPSolverSettings& pb_settin
   }
 
   // Branching
-  settings.reliability_branching           = pb_settings.reliability_branching();
-  settings.mip_batch_pdlp_strong_branching = pb_settings.mip_batch_pdlp_strong_branching();
+  settings.reliability_branching                    = pb_settings.reliability_branching();
+  settings.mip_batch_pdlp_strong_branching          = pb_settings.mip_batch_pdlp_strong_branching();
+  settings.mip_batch_pdlp_reliability_branching     =
+    pb_settings.mip_batch_pdlp_reliability_branching();
+  settings.mip_batch_branch_solver = pb_settings.mip_batch_branch_solver();
 
   // Cut configuration
   settings.max_cut_passes             = pb_settings.max_cut_passes();

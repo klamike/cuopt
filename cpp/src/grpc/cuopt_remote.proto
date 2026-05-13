@@ -157,7 +157,7 @@ message PDLPWarmStartData {
 }
 
 // MIP solver settings (field names match cuOpt Python/C++ API)
-// Dense numbering 1-28
+// Dense numbering 1-28; newer branching fields use 29+ to preserve wire compatibility.
 message MIPSolverSettings {
   // Limits
   double time_limit = 1;
@@ -185,6 +185,8 @@ message MIPSolverSettings {
   // Branching
   int32 reliability_branching = 16;
   int32 mip_batch_pdlp_strong_branching = 17;
+  int32 mip_batch_pdlp_reliability_branching = 29;
+  int32 mip_batch_branch_solver = 30;
 
   // Cut configuration
   int32 max_cut_passes = 18;

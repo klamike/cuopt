@@ -24,6 +24,13 @@
 
 #include <omp.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <mutex>
+#include <type_traits>
+
 namespace cuopt::linear_programming::dual_simplex {
 namespace {
 
@@ -691,6 +698,191 @@ static std::pair<f_t, sb_source_t> merge_sb_result(f_t dual_simplex_val,
   return {std::numeric_limits<f_t>::quiet_NaN(), sb_source_t::NONE};
 }
 
+enum class batch_branch_solver_t : int { PDLP = 0, MADIPM = 1 };
+
+enum class libmad_batch_status_t : long long {
+  UNKNOWN         = 0,
+  OPTIMAL         = 1,
+  INFEASIBLE      = 2,
+  UNBOUNDED       = 3,
+  INTERRUPTED     = 4,
+  ITERATION_LIMIT = 5,
+  TIME_LIMIT      = 6,
+  ERROR           = 7,
+};
+
+template <typename i_t, typename f_t>
+static bool use_madipm_batch_branch_solver(
+  const simplex_solver_settings_t<i_t, f_t>& settings)
+{
+  return settings.mip_batch_branch_solver == static_cast<i_t>(batch_branch_solver_t::MADIPM);
+}
+
+static const char* batch_branch_solver_name(int solver)
+{
+  return solver == static_cast<int>(batch_branch_solver_t::MADIPM) ? "MadIPM" : "PDLP";
+}
+
+using libmad_termination_check_t = int (*)(void*);
+
+using libmad_madipm_batch_lp_solve_csr_device_fn = int (*)(long long,
+                                                           long long,
+                                                           long long,
+                                                           long long,
+                                                           const int32_t*,
+                                                           const int32_t*,
+                                                           const double*,
+                                                           const double*,
+                                                           double,
+                                                           double,
+                                                           const double*,
+                                                           const double*,
+                                                           const double*,
+                                                           const double*,
+                                                           const long long*,
+                                                           const double*,
+                                                           const double*,
+                                                           double,
+                                                           double,
+                                                           long long,
+                                                           libmad_termination_check_t,
+                                                           void*,
+                                                           long long*,
+                                                           double*,
+                                                           long long*);
+
+static libmad_madipm_batch_lp_solve_csr_device_fn load_libmad_madipm_batch_solver()
+{
+  static std::mutex mutex;
+  static bool attempted = false;
+  static void* handle   = nullptr;
+  static libmad_madipm_batch_lp_solve_csr_device_fn fn = nullptr;
+
+  std::lock_guard<std::mutex> guard(mutex);
+  if (attempted) { return fn; }
+  attempted = true;
+
+  const char* path = std::getenv("CUOPT_LIBMAD_PATH");
+  if (path == nullptr || std::strlen(path) == 0) { path = "libMad.so"; }
+  handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+  if (handle == nullptr) { return nullptr; }
+  fn = reinterpret_cast<libmad_madipm_batch_lp_solve_csr_device_fn>(
+    dlsym(handle, "libmad_madipm_batch_lp_solve_csr_device"));
+  return fn;
+}
+
+static int libmad_atomic_halt(void* data)
+{
+  auto* halt = static_cast<std::atomic<int>*>(data);
+  return halt != nullptr && halt->load() != 0 ? 1 : 0;
+}
+
+template <typename f_t>
+struct madipm_batch_result_t {
+  bool ok{false};
+  std::vector<long long> status;
+  std::vector<f_t> objective;
+  std::vector<long long> iterations;
+};
+
+template <typename i_t, typename f_t>
+static madipm_batch_result_t<f_t> madipm_batch_branch_solve(
+  logger_t& log,
+  const raft::handle_t* handle_ptr,
+  const cuopt::mps_parser::mps_data_model_t<i_t, f_t>& mps_model,
+  const std::vector<i_t>& variables,
+  const std::vector<f_t>& values,
+  f_t time_limit,
+  f_t tol,
+  std::atomic<int>& concurrent_halt)
+{
+  madipm_batch_result_t<f_t> result;
+  if constexpr (!std::is_same_v<f_t, double>) {
+    log.debug("MadIPM batch branching is only wired for Float64 models\n");
+    return result;
+  } else if constexpr (sizeof(i_t) != sizeof(int32_t)) {
+    log.debug("MadIPM batch branching requires 32-bit cuOpt indices\n");
+    return result;
+  } else {
+    auto fn = load_libmad_madipm_batch_solver();
+    if (fn == nullptr) {
+      log.debug("MadIPM batch branching requested but libMad could not be loaded\n");
+      return result;
+    }
+    const i_t batch_size = static_cast<i_t>(2 * variables.size());
+    result.status.assign(batch_size, static_cast<long long>(libmad_batch_status_t::UNKNOWN));
+    result.objective.assign(batch_size, std::numeric_limits<f_t>::quiet_NaN());
+    result.iterations.assign(batch_size, 0);
+
+    std::vector<long long> branch_var(batch_size);
+    std::vector<double> branch_lower(batch_size);
+    std::vector<double> branch_upper(batch_size);
+    const auto& base_lb = mps_model.get_variable_lower_bounds();
+    const auto& base_ub = mps_model.get_variable_upper_bounds();
+    for (size_t k = 0; k < variables.size(); ++k) {
+      const i_t j = variables[k];
+      branch_var[k]       = static_cast<long long>(j);
+      branch_lower[k]     = static_cast<double>(base_lb[j]);
+      branch_upper[k]     = std::floor(static_cast<double>(values[k]));
+      branch_var[k + variables.size()]   = static_cast<long long>(j);
+      branch_lower[k + variables.size()] = std::ceil(static_cast<double>(values[k]));
+      branch_upper[k + variables.size()] = static_cast<double>(base_ub[j]);
+    }
+
+    auto op_problem =
+      cuopt::linear_programming::mps_data_model_to_optimization_problem(handle_ptr, mps_model);
+    handle_ptr->sync_stream();
+
+    const int rc = fn(static_cast<long long>(op_problem.get_n_variables()),
+                      static_cast<long long>(op_problem.get_n_constraints()),
+                      static_cast<long long>(op_problem.get_nnz()),
+                      static_cast<long long>(batch_size),
+                      reinterpret_cast<const int32_t*>(
+                        op_problem.get_constraint_matrix_offsets().data()),
+                      reinterpret_cast<const int32_t*>(
+                        op_problem.get_constraint_matrix_indices().data()),
+                      reinterpret_cast<const double*>(op_problem.get_constraint_matrix_values().data()),
+                      reinterpret_cast<const double*>(op_problem.get_objective_coefficients().data()),
+                      static_cast<double>(op_problem.get_objective_scaling_factor()),
+                      static_cast<double>(op_problem.get_objective_offset()),
+                      reinterpret_cast<const double*>(op_problem.get_variable_lower_bounds().data()),
+                      reinterpret_cast<const double*>(op_problem.get_variable_upper_bounds().data()),
+                      reinterpret_cast<const double*>(op_problem.get_constraint_lower_bounds().data()),
+                      reinterpret_cast<const double*>(op_problem.get_constraint_upper_bounds().data()),
+                      branch_var.data(),
+                      branch_lower.data(),
+                      branch_upper.data(),
+                      static_cast<double>(tol),
+                      static_cast<double>(time_limit),
+                      3000,
+                      libmad_atomic_halt,
+                      &concurrent_halt,
+                      result.status.data(),
+                      reinterpret_cast<double*>(result.objective.data()),
+                      result.iterations.data());
+    result.ok = (rc == 0);
+    if (!result.ok) { log.debug("MadIPM batch branching failed with code %d\n", rc); }
+    return result;
+  }
+}
+
+template <typename f_t>
+static bool _libmad_status_has_objective(long long status)
+{
+  auto st = static_cast<libmad_batch_status_t>(status);
+  return st == libmad_batch_status_t::OPTIMAL || st == libmad_batch_status_t::INFEASIBLE;
+}
+
+template <typename f_t>
+static f_t _libmad_branch_objective(long long status, f_t objective)
+{
+  auto st = static_cast<libmad_batch_status_t>(status);
+  if (st == libmad_batch_status_t::INFEASIBLE) {
+    return std::numeric_limits<f_t>::infinity();
+  }
+  return objective;
+}
+
 template <typename i_t, typename f_t>
 static void batch_pdlp_strong_branching_task(
   const simplex_solver_settings_t<i_t, f_t>& settings,
@@ -708,10 +900,12 @@ static void batch_pdlp_strong_branching_task(
   std::vector<f_t>& pdlp_obj_up)
 {
   constexpr bool verbose = false;
+  const bool use_madipm = use_madipm_batch_branch_solver(settings);
 
   settings.log.printf(effective_batch_pdlp == 2
-                        ? "Batch PDLP only for strong branching\n"
-                        : "Cooperative batch PDLP and Dual Simplex for strong branching\n");
+                        ? "Batch %s only for strong branching\n"
+                        : "Cooperative batch %s and Dual Simplex for strong branching\n",
+                      batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)));
 
   f_t start_batch = tic();
   std::vector<f_t> original_root_soln_x;
@@ -740,6 +934,45 @@ static void batch_pdlp_strong_branching_task(
   const f_t warm_start_remaining_time =
     std::max(static_cast<f_t>(0.0), settings.time_limit - batch_elapsed_time);
   if (warm_start_remaining_time <= 0.0) { return; }
+
+  if (use_madipm) {
+    const auto solutions = madipm_batch_branch_solve(settings.log,
+                                                     &pc.pdlp_warm_cache->batch_pdlp_handle,
+                                                     mps_model,
+                                                     fractional,
+                                                     fraction_values,
+                                                     warm_start_remaining_time,
+                                                     std::max(settings.primal_tol, settings.dual_tol),
+                                                     concurrent_halt);
+    f_t batch_madipm_strong_branching_time = toc(start_batch);
+    if (!solutions.ok || solutions.status.size() != fractional.size() * 2) { return; }
+    i_t max_iterations = 0;
+    i_t amount_done    = 0;
+    for (size_t k = 0; k < solutions.status.size(); ++k) {
+      max_iterations = std::max(max_iterations, static_cast<i_t>(solutions.iterations[k]));
+      if (_libmad_status_has_objective<f_t>(solutions.status[k])) { amount_done++; }
+    }
+    if (verbose) {
+      settings.log.printf(
+        "Batch MadIPM strong branching completed in %.2fs. Solved %d/%d with max %d iterations\n",
+        batch_madipm_strong_branching_time,
+        amount_done,
+        fractional.size() * 2,
+        max_iterations);
+    }
+    for (i_t k = 0; k < fractional.size(); k++) {
+      if (_libmad_status_has_objective<f_t>(solutions.status[k])) {
+        const f_t obj = _libmad_branch_objective<f_t>(solutions.status[k], solutions.objective[k]);
+        pdlp_obj_down[k] = std::max(obj - root_obj, f_t(0.0));
+      }
+      if (_libmad_status_has_objective<f_t>(solutions.status[k + fractional.size()])) {
+        const f_t obj = _libmad_branch_objective<f_t>(
+          solutions.status[k + fractional.size()], solutions.objective[k + fractional.size()]);
+        pdlp_obj_up[k] = std::max(obj - root_obj, f_t(0.0));
+      }
+    }
+    return;
+  }
 
   assert(!pc.pdlp_warm_cache->populated && "PDLP warm cache should not be populated at this point");
 
@@ -903,8 +1136,10 @@ static void batch_pdlp_reliability_branching_task(
   std::vector<f_t>& pdlp_obj_down,
   std::vector<f_t>& pdlp_obj_up)
 {
-  log.debug(rb_mode == 2 ? "RB batch PDLP only for %d candidates\n"
-                         : "RB cooperative batch PDLP and DS for %d candidates\n",
+  const bool use_madipm = use_madipm_batch_branch_solver(settings);
+  log.debug(rb_mode == 2 ? "RB batch %s only for %d candidates\n"
+                         : "RB cooperative batch %s and DS for %d candidates\n",
+            batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)),
             num_candidates);
 
   f_t start_batch = tic();
@@ -938,6 +1173,40 @@ static void batch_pdlp_reliability_branching_task(
 
   // One handle per batch PDLP since there can be concurrent calls
   const raft::handle_t batch_pdlp_handle;
+
+  if (use_madipm) {
+    const auto solutions = madipm_batch_branch_solve(log,
+                                                     &batch_pdlp_handle,
+                                                     mps_model,
+                                                     candidate_vars,
+                                                     fraction_values,
+                                                     batch_remaining_time,
+                                                     std::max(settings.primal_tol, settings.dual_tol),
+                                                     concurrent_halt);
+    f_t batch_madipm_time = toc(start_batch);
+    if (!solutions.ok || solutions.status.size() != static_cast<size_t>(num_candidates) * 2) {
+      return;
+    }
+    i_t amount_done = 0;
+    for (i_t k = 0; k < num_candidates * 2; k++) {
+      if (_libmad_status_has_objective<f_t>(solutions.status[k])) { amount_done++; }
+    }
+    log.debug("RB batch MadIPM completed in %.2fs. Solved %d/%d\n",
+              batch_madipm_time,
+              amount_done,
+              num_candidates * 2);
+    for (i_t k = 0; k < num_candidates; k++) {
+      if (_libmad_status_has_objective<f_t>(solutions.status[k])) {
+        pdlp_obj_down[k] =
+          _libmad_branch_objective<f_t>(solutions.status[k], solutions.objective[k]);
+      }
+      if (_libmad_status_has_objective<f_t>(solutions.status[k + num_candidates])) {
+        pdlp_obj_up[k] = _libmad_branch_objective<f_t>(
+          solutions.status[k + num_candidates], solutions.objective[k + num_candidates]);
+      }
+    }
+    return;
+  }
 
   pdlp_solver_settings_t<i_t, f_t> pdlp_settings;
   if (rb_mode == 1) {
@@ -1190,9 +1459,11 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
       if (!std::isnan(pdlp_obj_up[k])) pdlp_optimal_count++;
     }
 
-    settings.log.printf("Batch PDLP found %d/%d optimal solutions\n",
-                        pdlp_optimal_count,
-                        static_cast<int>(fractional.size() * 2));
+    settings.log.printf(
+      "Batch %s found %d/%d completed branch solves\n",
+      batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)),
+      pdlp_optimal_count,
+      static_cast<int>(fractional.size() * 2));
   }
 
   if (effective_batch_pdlp != 0) {
@@ -1226,12 +1497,14 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
         if (ds_has && pdlp_has && verbose) {
           solved_by_both++;
           settings.log.printf(
-            "[COOP SB] Merge: variable %d %s solved by BOTH (DS=%e PDLP=%e) -> kept %s\n",
+            "[COOP SB] Merge: variable %d %s solved by BOTH (DS=%e batch=%e) -> kept %s\n",
             fractional[k],
             is_down ? "DOWN" : "UP",
             ds_obj,
             pdlp_obj,
-            source == sb_source_t::DUAL_SIMPLEX ? "DS" : "PDLP");
+            source == sb_source_t::DUAL_SIMPLEX ? "DS"
+                                                : batch_branch_solver_name(static_cast<int>(
+                                                    settings.mip_batch_branch_solver)));
         }
       }
     }
@@ -1240,10 +1513,11 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
       (f_t(merged_from_pdlp) / f_t(fractional.size() * 2)) * 100.0;
     if (verbose) {
       settings.log.printf(
-        "Batch PDLP for strong branching. Percent solved by batch PDLP at root: %f\n",
+        "Batch %s for strong branching. Percent solved by batch backend at root: %f\n",
+        batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)),
         pc.pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root);
       settings.log.printf(
-        "Merged results: %d from DS, %d from PDLP, %d unresolved (NaN), %d solved by both\n",
+        "Merged results: %d from DS, %d from batch backend, %d unresolved (NaN), %d solved by both\n",
         merged_from_ds,
         merged_from_pdlp,
         merged_nan,
@@ -1436,19 +1710,15 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     return branch_var;
   }
 
-  // 0: no batch PDLP, 1: cooperative batch PDLP and DS, 2: batch PDLP only
+  // 0: no batch backend, 1: cooperative batch backend and DS, 2: batch backend only.
   const i_t rb_mode = settings.mip_batch_pdlp_reliability_branching;
+  const bool use_madipm = use_madipm_batch_branch_solver(settings);
 
-  // We don't use batch PDLP in reliability branching if the PDLP warm start data was not filled
-  // This indicates that PDLP alone (not batched) couldn't even run at the root node
-  // So it will most likely perform poorly compared to DS
-  // It is also off if the number of candidate is very small
-  // If warm start could run but almost none of the BPDLP results were used, we also want to avoid
-  // using batch PDLP
+  // Automatic mode uses the batch backend only when the root strong-branching batch was useful.
+  // PDLP also needs its root warm-start cache. MadIPM builds directly from the LP data on device.
   constexpr i_t min_num_candidates_for_pdlp                       = 5;
   constexpr f_t min_percent_solved_by_batch_pdlp_at_root_for_pdlp = 5.0;
-  // Batch PDLP is either forced or we use the heuristic to decide if it should be used
-  // Check if batch PDLP was forced to be on
+  // Batch backend is either forced or we use the heuristic to decide if it should be used.
   bool use_pdlp = rb_mode == 2;
 
   // Use the heuristic to decide if it should be used (in case it is set to automatic)
@@ -1457,13 +1727,13 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     use_pdlp = !settings.sub_mip;
     use_pdlp &= !settings.deterministic;
 
-    // Check if the warm cache was filled at the root
-    use_pdlp &= pdlp_warm_cache->populated;
+    // Check if the backend has the root data it needs
+    use_pdlp &= use_madipm || pdlp_warm_cache->populated;
 
     // Check if there are enough candidates for batch PDLP
     use_pdlp &= unreliable_list.size() > min_num_candidates_for_pdlp;
 
-    // Check if batch PDLP was effective for strong branching at the root node
+    // Check if the batch backend was effective for strong branching at the root node.
     use_pdlp &= pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root >
                 min_percent_solved_by_batch_pdlp_at_root_for_pdlp;
 
@@ -1471,38 +1741,23 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     use_pdlp &= omp_get_num_threads() >= CUOPT_MIP_BATCH_PDLP_REQUIRED_THREAD_COUNT;
   }
 
-  // Use the heuristic to decide if it should be used (in case it is set to automatic)
-  if (!use_pdlp && rb_mode != 0) {
-    // Check if it is a sub MIP or the determinism mode is on.
-    use_pdlp = !settings.sub_mip;
-    use_pdlp &= !settings.deterministic;
-
-    // Check if the warm cache was filled at the root
-    use_pdlp &= pdlp_warm_cache->populated;
-
-    // Check if there are enough candidates for batch PDLP
-    use_pdlp &= unreliable_list.size() > min_num_candidates_for_pdlp;
-
-    // Check if batch PDLP was effective for strong branching at the root node
-    use_pdlp &= pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root >
-                min_percent_solved_by_batch_pdlp_at_root_for_pdlp;
-  }
-
-  if (rb_mode != 0 && !pdlp_warm_cache->populated) {
+  if (rb_mode != 0 && !use_madipm && !pdlp_warm_cache->populated) {
     settings.log.debug("PDLP warm start data not populated, using DS only\n");
   } else if (rb_mode != 0 && settings.sub_mip) {
-    settings.log.debug("Batch PDLP reliability branching is disabled because sub-MIP is enabled\n");
+    settings.log.debug("Batch reliability branching is disabled because sub-MIP is enabled\n");
   } else if (rb_mode != 0 && settings.deterministic) {
     settings.log.debug(
-      "Batch PDLP reliability branching is disabled because deterministic mode is enabled\n");
+      "Batch reliability branching is disabled because deterministic mode is enabled\n");
   } else if (rb_mode != 0 && unreliable_list.size() < min_num_candidates_for_pdlp) {
-    settings.log.debug("Not enough candidates to use batch PDLP, using DS only\n");
-  } else if (rb_mode != 0 && pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root < 5.0) {
-    settings.log.debug("Percent solved by batch PDLP at root is too low, using DS only\n");
+    settings.log.debug("Not enough candidates to use batch backend, using DS only\n");
+  } else if (rb_mode != 0 && !use_pdlp &&
+             pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root < 5.0) {
+    settings.log.debug("Percent solved by batch backend at root is too low, using DS only\n");
   } else if (use_pdlp) {
     settings.log.debug(
-      "Using batch PDLP because populated, unreliable list size is %d (> %d), and percent solved "
-      "by batch PDLP at root is %f%% (> %f%%)\n",
+      "Using batch %s because unreliable list size is %d (> %d), and percent solved "
+      "by batch backend at root is %f%% (> %f%%)\n",
+      batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)),
       static_cast<i_t>(unreliable_list.size()),
       min_num_candidates_for_pdlp,
       pdlp_warm_cache->percent_solved_by_batch_pdlp_at_root,
@@ -1511,7 +1766,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
 
   const int num_tasks     = std::max(max_num_tasks, 1);
   const int task_priority = reliability_branching_settings.task_priority;
-  // If both batch PDLP and DS are used we double the max number of candidates
+  // If both the batch backend and DS are used we double the max number of candidates.
   const i_t max_num_candidates = use_pdlp ? 2 * reliability_branching_settings.max_num_candidates
                                           : reliability_branching_settings.max_num_candidates;
   const i_t num_candidates     = std::min<size_t>(unreliable_list.size(), max_num_candidates);
@@ -1629,7 +1884,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
     settings.log.debug("Time limit reached\n");
     if (use_pdlp) {
       concurrent_halt.store(1);
-#pragma omp taskwait  // Wait for the batch PDLP task to finish
+#pragma omp taskwait  // Wait for the batch branch task to finish
     }
     return branch_var;
   }
@@ -1650,7 +1905,10 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
 
       if (rb_mode == 1 && sb_view.is_solved(i)) {
         settings.log.debug(
-          "DS skipping variable %d branch down (shared_idx %d): already solved by PDLP\n", j, i);
+          "DS skipping variable %d branch down (shared_idx %d): already solved by %s\n",
+          j,
+          i,
+          batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)));
       } else {
         pseudo_cost_mutex_down[j].lock();
         if (pseudo_cost_num_down[j] < reliable_threshold) {
@@ -1683,7 +1941,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
             if (rb_mode == 1 && is_dual_simplex_done(status)) { sb_view.mark_solved(i); }
           }
         } else {
-          // Variable became reliable, make it as solved so that batch PDLP does not solve it again
+          // Variable became reliable; let the cooperative batch backend skip it.
           if (rb_mode == 1) sb_view.mark_solved(i);
         }
         pseudo_cost_mutex_down[j].unlock();
@@ -1694,9 +1952,10 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
       const i_t shared_idx = i + num_candidates;
       if (rb_mode == 1 && sb_view.is_solved(shared_idx)) {
         settings.log.debug(
-          "DS skipping variable %d branch up (shared_idx %d): already solved by PDLP\n",
+          "DS skipping variable %d branch up (shared_idx %d): already solved by %s\n",
           j,
-          shared_idx);
+          shared_idx,
+          batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)));
       } else {
         pseudo_cost_mutex_up[j].lock();
         if (pseudo_cost_num_up[j] < reliable_threshold) {
@@ -1728,7 +1987,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
             if (rb_mode == 1 && is_dual_simplex_done(status)) { sb_view.mark_solved(shared_idx); }
           }
         } else {
-          // Variable became reliable, make it as solved so that batch PDLP does not solve it again
+          // Variable became reliable; let the cooperative batch backend skip it.
           if (rb_mode == 1) sb_view.mark_solved(shared_idx);
         }
         pseudo_cost_mutex_up[j].unlock();
@@ -1805,7 +2064,8 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
       }
     }
 
-    settings.log.debug("RB batch PDLP: %d candidates, %d/%d optimal, %d applied to pseudo-costs\n",
+    settings.log.debug("RB batch %s: %d candidates, %d/%d optimal, %d applied to pseudo-costs\n",
+                       batch_branch_solver_name(static_cast<int>(settings.mip_batch_branch_solver)),
                        num_candidates,
                        pdlp_optimal,
                        num_candidates * 2,

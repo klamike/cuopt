@@ -146,6 +146,9 @@ int run_single_file(std::string file_path,
                     bool write_log_file,
                     bool log_to_console,
                     int reliability_branching,
+                    int mip_batch_pdlp_strong_branching,
+                    int mip_batch_pdlp_reliability_branching,
+                    int mip_batch_branch_solver,
                     double time_limit,
                     double work_limit,
                     bool deterministic)
@@ -207,6 +210,9 @@ int run_single_file(std::string file_path,
   settings.num_cpu_threads  = num_cpu_threads;
   settings.log_to_console   = log_to_console;
   settings.determinism_mode = deterministic ? CUOPT_MODE_DETERMINISTIC : CUOPT_MODE_OPPORTUNISTIC;
+  settings.mip_batch_pdlp_strong_branching      = mip_batch_pdlp_strong_branching;
+  settings.mip_batch_pdlp_reliability_branching = mip_batch_pdlp_reliability_branching;
+  settings.mip_batch_branch_solver              = mip_batch_branch_solver;
   settings.tolerances.relative_tolerance = 1e-12;
   settings.tolerances.absolute_tolerance = 1e-6;
   settings.presolver                     = cuopt::linear_programming::presolver_t::Default;
@@ -266,6 +272,9 @@ void run_single_file_mp(std::string file_path,
                         bool write_log_file,
                         bool log_to_console,
                         int reliability_branching,
+                        int mip_batch_pdlp_strong_branching,
+                        int mip_batch_pdlp_reliability_branching,
+                        int mip_batch_branch_solver,
                         double time_limit,
                         double work_limit,
                         bool deterministic)
@@ -284,6 +293,9 @@ void run_single_file_mp(std::string file_path,
                                   write_log_file,
                                   log_to_console,
                                   reliability_branching,
+                                  mip_batch_pdlp_strong_branching,
+                                  mip_batch_pdlp_reliability_branching,
+                                  mip_batch_branch_solver,
                                   time_limit,
                                   work_limit,
                                   deterministic);
@@ -379,6 +391,21 @@ int main(int argc, char* argv[])
     .scan<'i', int>()
     .default_value(-1);
 
+  program.add_argument("--mip-batch-pdlp-strong-branching")
+    .help("batch strong branching mode: 0 (disable), 1 (cooperative), 2 (batch only)")
+    .scan<'i', int>()
+    .default_value(0);
+
+  program.add_argument("--mip-batch-pdlp-reliability-branching")
+    .help("batch reliability branching mode: 0 (disable), 1 (cooperative), 2 (batch only)")
+    .scan<'i', int>()
+    .default_value(0);
+
+  program.add_argument("--mip-batch-branch-solver")
+    .help("batch LP backend for MIP branching: 0 (PDLP), 1 (MadIPM/libMad)")
+    .scan<'i', int>()
+    .default_value(0);
+
   program.add_argument("-d", "--determinism")
     .help("enable deterministic mode")
     .default_value(false)
@@ -414,6 +441,11 @@ int main(int argc, char* argv[])
   double memory_limit       = program.get<double>("--memory-limit");
   bool track_allocations    = program.get<std::string>("--track-allocations")[0] == 't';
   int reliability_branching = program.get<int>("--reliability-branching");
+  int mip_batch_pdlp_strong_branching =
+    program.get<int>("--mip-batch-pdlp-strong-branching");
+  int mip_batch_pdlp_reliability_branching =
+    program.get<int>("--mip-batch-pdlp-reliability-branching");
+  int mip_batch_branch_solver = program.get<int>("--mip-batch-branch-solver");
   bool deterministic        = program.get<bool>("--determinism");
 
   if (num_cpu_threads < 0) {
@@ -512,6 +544,9 @@ int main(int argc, char* argv[])
                                write_log_file,
                                log_to_console,
                                reliability_branching,
+                               mip_batch_pdlp_strong_branching,
+                               mip_batch_pdlp_reliability_branching,
+                               mip_batch_branch_solver,
                                time_limit,
                                work_limit,
                                deterministic);
@@ -555,6 +590,9 @@ int main(int argc, char* argv[])
                     write_log_file,
                     log_to_console,
                     reliability_branching,
+                    mip_batch_pdlp_strong_branching,
+                    mip_batch_pdlp_reliability_branching,
+                    mip_batch_branch_solver,
                     time_limit,
                     work_limit,
                     deterministic);

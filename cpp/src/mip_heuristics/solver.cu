@@ -347,6 +347,8 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
       context.settings.mip_batch_pdlp_strong_branching;
     branch_and_bound_settings.mip_batch_pdlp_reliability_branching =
       context.settings.mip_batch_pdlp_reliability_branching;
+    branch_and_bound_settings.mip_batch_branch_solver =
+      context.settings.mip_batch_branch_solver;
 
     branch_and_bound_settings.strong_branching_simplex_iteration_limit =
       context.settings.strong_branching_simplex_iteration_limit < 0
@@ -449,19 +451,33 @@ solution_t<i_t, f_t> mip_solver_t<i_t, f_t>::run_solver()
     }
   }
 
-#pragma omp taskgroup
-  {
-    if (!context.settings.heuristics_only) {
-#pragma omp task default(shared)
-      {
-        branch_and_bound_status = branch_and_bound->solve(branch_and_bound_solution);
-      }
-    }
+  const bool madipm_batch_branching =
+    !context.settings.heuristics_only && context.settings.mip_batch_branch_solver == 1 &&
+    (context.settings.mip_batch_pdlp_strong_branching != 0 ||
+     context.settings.mip_batch_pdlp_reliability_branching != 0);
 
-    // Start the primal heuristics
-    context.diversity_manager_ptr = &dm;
-    sol                           = dm.run_solver();
-  }  // implicit barrier for all tasks created in B&B and heuristics
+  if (madipm_batch_branching) {
+    CUOPT_LOG_INFO(
+      "MadIPM batch branching selected, running B&B without concurrent primal heuristics");
+    branch_and_bound_status = branch_and_bound->solve(branch_and_bound_solution);
+    if (branch_and_bound_solution.has_incumbent) {
+      sol.copy_new_assignment(branch_and_bound_solution.x);
+    }
+  } else {
+#pragma omp taskgroup
+    {
+      if (!context.settings.heuristics_only) {
+#pragma omp task default(shared)
+        {
+          branch_and_bound_status = branch_and_bound->solve(branch_and_bound_solution);
+        }
+      }
+
+      // Start the primal heuristics
+      context.diversity_manager_ptr = &dm;
+      sol                           = dm.run_solver();
+    }  // implicit barrier for all tasks created in B&B and heuristics
+  }
 
   if (!context.settings.heuristics_only) {
     if (branch_and_bound_solution.lower_bound > -std::numeric_limits<f_t>::infinity()) {
