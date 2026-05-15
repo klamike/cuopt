@@ -5,6 +5,16 @@
  */
 /* clang-format on */
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc++11-narrowing"
+#pragma clang diagnostic ignored "-Wimplicit-const-int-float-conversion"
+#else
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Wnarrowing"
+#endif
+
 // Papilo's ProbingView::reset() guards bounds restoration with #ifndef NDEBUG.
 // This causes invalid (-1) column indices due to bugs in the Probing presolver.
 // Force-include ProbingView.hpp with NDEBUG undefined so the restoration is compiled in.
@@ -19,15 +29,6 @@
 #include <PSLP/PSLP_status.h>
 #include <cuopt/error.hpp>
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc++11-narrowing"
-#pragma clang diagnostic ignored "-Wimplicit-const-int-float-conversion"
-#else
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#pragma GCC diagnostic ignored "-Wnarrowing"
-#endif
 #include <papilo/core/Presolve.hpp>
 #include <papilo/core/ProblemBuilder.hpp>
 #if defined(__clang__)
